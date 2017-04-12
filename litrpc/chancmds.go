@@ -3,6 +3,7 @@ package litrpc
 import (
 	"fmt"
 
+	"github.com/mit-dci/lit/portxo"
 	"github.com/mit-dci/lit/qln"
 )
 
@@ -63,7 +64,7 @@ type FundArgs struct {
 }
 
 func (r *LitRPC) FundChannel(args FundArgs, reply *StatusReply) error {
-
+	var err error
 	if r.Node.InProg != nil && r.Node.InProg.PeerIdx != 0 {
 		return fmt.Errorf("channel with peer %d not done yet", r.Node.InProg.PeerIdx)
 	}
@@ -79,16 +80,22 @@ func (r *LitRPC) FundChannel(args FundArgs, reply *StatusReply) error {
 			args.InitialSend, args.Capacity)
 	}
 
+	nowHeight := r.Node.SubWallet.CurrentHeight()
+
 	// see if we have enough money before calling the funding function.  Not
 	// strictly required but it's better to fail here instead of after net traffic.
-	// The litNode doesn't actually know how much money the basewallet has.
-	// So it could potentially try to start a channel and fail because it doesn't have
-	// the money.  Safe enough as all it's done is requested a point, which is
-	// idempotent on both sides.
 	// also assume a fee of like 50K sat just to be safe
-	_, _, err := r.SCon.TS.PickUtxos(args.Capacity+50000, true)
+	var allPorTxos portxo.TxoSliceByAmt
+	allPorTxos, err = r.Node.SubWallet.UtxoDump()
 	if err != nil {
 		return err
+	}
+
+	spendable := allPorTxos.SumWitness(nowHeight)
+
+	if args.Capacity > spendable-50000 {
+		return fmt.Errorf("Wanted %d but %d available for channel creation",
+			args.Capacity, spendable-50000)
 	}
 
 	idx, err := r.Node.FundChannel(args.Peer, args.Capacity, args.InitialSend)
@@ -223,6 +230,5 @@ func (r *LitRPC) BreakChannel(args ChanArgs, reply *StatusReply) error {
 	reply.Status = fmt.Sprintf("Broke channel %d with tx %s",
 		args.ChanIdx, tx.TxHash().String())
 	// broadcast
-	return r.Node.BaseWallet.PushTx(tx)
-
+	return r.Node.SubWallet.PushTx(tx)
 }

@@ -1,12 +1,11 @@
 package uspv
 
 import (
-	"fmt"
 	"log"
 
 	"github.com/btcsuite/btcd/wire"
-	"github.com/btcsuite/btcutil"
 	"github.com/btcsuite/btcutil/bloom"
+	"github.com/mit-dci/lit/lnutil"
 )
 
 func (s *SPVCon) incomingMessageHandler() {
@@ -81,7 +80,7 @@ func (s *SPVCon) fPositiveHandler() {
 	for {
 		fpAccumulator += <-s.fPositives // blocks here
 		if fpAccumulator > 7 {
-			filt, err := s.TS.GimmeFilter()
+			filt, err := s.GimmeFilter()
 			if err != nil {
 				log.Printf("Filter creation error: %s\n", err.Error())
 				log.Printf("uhoh, crashing filter handler")
@@ -89,7 +88,7 @@ func (s *SPVCon) fPositiveHandler() {
 			}
 			// send filter
 			s.Refilter(filt)
-			fmt.Printf("sent filter %x\n", filt.MsgFilterLoad().Filter)
+			log.Printf("sent filter %x\n", filt.MsgFilterLoad().Filter)
 
 			// clear the channel
 		finClear:
@@ -102,7 +101,7 @@ func (s *SPVCon) fPositiveHandler() {
 				}
 			}
 
-			fmt.Printf("reset %d false positives\n", fpAccumulator)
+			log.Printf("reset %d false positives\n", fpAccumulator)
 			// reset accumulator
 			fpAccumulator = 0
 		}
@@ -125,21 +124,17 @@ func (s *SPVCon) HeaderHandler(m *wire.MsgHeaders) {
 	}
 	// no moar, done w/ headers, send filter and get blocks
 	if !s.HardMode { // don't send this in hardmode! that's the whole point
-		filt, err := s.TS.GimmeFilter()
+		filt, err := s.GimmeFilter()
 		if err != nil {
 			log.Printf("AskForBlocks error: %s", err.Error())
 			return
 		}
 		// send filter
 		s.SendFilter(filt)
-		fmt.Printf("sent filter %x\n", filt.MsgFilterLoad().Filter)
+		log.Printf("sent filter %x\n", filt.MsgFilterLoad().Filter)
 	}
-	dbTip, err := s.TS.GetDBSyncHeight()
-	if err != nil {
-		log.Printf("AskForBlocks error: %s", err.Error())
-		return
-	}
-	err = s.AskForBlocks(dbTip)
+
+	err = s.AskForBlocks()
 	if err != nil {
 		log.Printf("AskForBlocks error: %s", err.Error())
 		return
@@ -148,17 +143,17 @@ func (s *SPVCon) HeaderHandler(m *wire.MsgHeaders) {
 
 // TxHandler takes in transaction messages that come in from either a request
 // after an inv message or after a merkle block message.
-func (s *SPVCon) TxHandler(m *wire.MsgTx) {
-	log.Printf("received msgtx %s\n", m.TxHash().String())
+func (s *SPVCon) TxHandler(tx *wire.MsgTx) {
+	log.Printf("received msgtx %s\n", tx.TxHash().String())
 	// check if we have a height for this tx.
 	s.OKMutex.Lock()
-	height, ok := s.OKTxids[m.TxHash()]
+	height, ok := s.OKTxids[tx.TxHash()]
 	s.OKMutex.Unlock()
 	// if we don't have a height for this / it's not in the map, discard.
 	// currently CRASHES when this happens because I want to see if it ever does.
 	// it shouldn't if things are working properly.
 	if !ok {
-		log.Printf("Tx %s unknown, will not ingest\n", m.TxHash().String())
+		log.Printf("Tx %s unknown, will not ingest\n", tx.TxHash().String())
 		panic("unknown tx")
 		return
 	}
@@ -181,38 +176,10 @@ func (s *SPVCon) TxHandler(m *wire.MsgTx) {
 	//		}
 	//	}
 
-	utilTx := btcutil.NewTx(m)
-	if !s.HardMode || s.localFilter.MatchTxAndUpdate(utilTx) {
-		hits, err := s.TS.Ingest(m, height)
-		if err != nil {
-			log.Printf("Incoming Tx error: %s\n", err.Error())
-			return
-		}
-
-		if hits == 0 {
-			log.Printf("tx %s had no hits, filter false positive.",
-				m.TxHash().String())
-			s.fPositives <- 1 // add one false positive to chan
-		} else {
-			// there was a hit, send new filter I guess.  Feels like
-			// you shouldn't have to..?
-			// make new filter
-			filt, err := s.TS.GimmeFilter()
-			if err != nil {
-				log.Printf("Incoming Tx error: %s\n", err.Error())
-				return
-			}
-			// send filter
-			s.Refilter(filt)
-		}
-		log.Printf("tx %s ingested and matches %d utxo/adrs.",
-			m.TxHash().String(), hits)
+	// send txs up to wallit
+	if s.MatchTx(tx) {
+		s.TxUpToWallit <- lnutil.TxAndHeight{tx, height}
 	}
-	if utilTx.Hash().String() == "c5cbac2c838a2ca75d5294afe13726813669cd81c75f87e25db232e42e70ee7e" {
-		//		panic("c5cbac2c")
-		log.Printf("ZZO got c5cbac2c spends 9f5e344d84a70101007944bcd109f6544df4df1cdca506c23ae94b45ce0b98f2")
-	}
-
 }
 
 // GetDataHandler responds to requests for tx data, which happen after
@@ -224,31 +191,14 @@ func (s *SPVCon) GetDataHandler(m *wire.MsgGetData) {
 		log.Printf("\t%d)%s : %s",
 			i, thing.Type.String(), thing.Hash.String())
 
-		// separate wittx and tx.  needed / combine?
-		// does the same thing right now
-		if thing.Type == wire.InvTypeWitnessTx {
-			tx, err := s.TS.GetTx(&thing.Hash)
-			if err != nil {
-				log.Printf("error getting tx %s: %s",
-					thing.Hash.String(), err.Error())
-				continue
+		// I think we do the same thing for witTx or tx...
+		// I don't think they'll request non-witness anyway.
+		if thing.Type == wire.InvTypeWitnessTx || thing.Type == wire.InvTypeTx {
+			tx, ok := s.TxMap[thing.Hash]
+			if !ok {
+				log.Printf("tx %s requested by we don't have it\n",
+					thing.Hash.String())
 			}
-			s.outMsgQueue <- tx
-			sent++
-			continue
-		}
-		if thing.Type == wire.InvTypeTx {
-			tx, err := s.TS.GetTx(&thing.Hash)
-			if err != nil {
-				log.Printf("error getting tx %s: %s",
-					thing.Hash.String(), err.Error())
-				continue
-			}
-			// Shouldn't connect to non-witness aware nodes anyway so
-			// probably remove this and just return an error?
-			// Right now returns a witness tx even if asked for regular tx.
-			//			tx.DeWitnessify()
-			//			tx.Flags = 0x00 // dewitnessify
 			s.outMsgQueue <- tx
 			sent++
 			continue
@@ -278,14 +228,14 @@ func (s *SPVCon) InvHandler(m *wire.MsgInv) {
 			select {
 			case <-s.inWaitState:
 				// start getting headers
-				fmt.Printf("asking for headers due to inv block\n")
+				log.Printf("asking for headers due to inv block\n")
 				err := s.AskForHeaders()
 				if err != nil {
 					log.Printf("AskForHeaders error: %s", err.Error())
 				}
 			default:
 				// drop it as if its component particles had high thermal energies
-				fmt.Printf("inv block but ignoring; not synced\n")
+				log.Printf("inv block but ignoring; not synced\n")
 			}
 		}
 	}

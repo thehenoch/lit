@@ -2,9 +2,11 @@ package litrpc
 
 import (
 	"fmt"
-	"sort"
 
-	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/adiabat/bech32"
+	"github.com/btcsuite/btcd/chaincfg"
+	"github.com/btcsuite/btcd/txscript"
+	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcutil"
 	"github.com/mit-dci/lit/portxo"
 )
@@ -26,30 +28,23 @@ type NoArgs struct {
 type BalReply struct {
 	ChanTotal   int64 // total balance in channels
 	TxoTotal    int64 // all utxos
-	Mature      int64 // confirmed and spendable
 	MatureWitty int64 // confirmed, spendable and witness
 }
 
 func (r *LitRPC) Bal(args *NoArgs, reply *BalReply) error {
-	// check current chain height; needed for time-locked outputs
-	curHeight, err := r.SCon.TS.GetDBSyncHeight()
+	var err error
+	var allTxos portxo.TxoSliceByAmt
+
+	nowHeight := r.Node.SubWallet.CurrentHeight()
+
+	allTxos, err = r.Node.SubWallet.UtxoDump()
 	if err != nil {
 		return err
 	}
-	allTxos, err := r.SCon.TS.GetAllUtxos()
-	if err != nil {
-		return err
-	}
-	// iterate through utxos to figure out how much we have
-	for _, u := range allTxos {
-		reply.TxoTotal += u.Value
-		if u.Height > 0 && u.Height+int32(u.Seq) <= curHeight {
-			reply.Mature += u.Value
-			if u.Mode&portxo.FlagTxoWitness != 0 {
-				reply.MatureWitty += u.Value
-			}
-		}
-	}
+
+	// ask sub-wallet for balance
+	reply.TxoTotal = allTxos.Sum()
+	reply.MatureWitty = allTxos.SumWitness(nowHeight)
 
 	// get all channel states
 	qcs, err := r.Node.GetAllQchans()
@@ -79,20 +74,19 @@ type TxoListReply struct {
 
 // TxoList sends back a list of all non-channel utxos
 func (r *LitRPC) TxoList(args *NoArgs, reply *TxoListReply) error {
-	allTxos, err := r.SCon.TS.GetAllUtxos()
+	allTxos, err := r.Node.SubWallet.UtxoDump()
 	if err != nil {
 		return err
 	}
-	syncHeight, err := r.SCon.TS.GetDBSyncHeight()
-	if err != nil {
-		return err
-	}
+
+	syncHeight := r.Node.SubWallet.CurrentHeight()
 
 	reply.Txos = make([]TxoInfo, len(allTxos))
 	for i, u := range allTxos {
 		reply.Txos[i].OutPoint = u.Op.String()
 		reply.Txos[i].Amt = u.Value
 		reply.Txos[i].Height = u.Height
+		// show delay before utxo can be spent
 		if u.Seq != 0 {
 			reply.Txos[i].Delay = u.Height + int32(u.Seq) - syncHeight
 		}
@@ -108,9 +102,8 @@ type SyncHeightReply struct {
 }
 
 func (r *LitRPC) SyncHeight(args *NoArgs, reply *SyncHeightReply) error {
-	var err error
-	reply.SyncHeight, err = r.SCon.TS.GetDBSyncHeight()
-	return err
+	reply.SyncHeight = r.Node.SubWallet.CurrentHeight()
+	return nil
 }
 
 // ------------------------- send
@@ -131,95 +124,87 @@ func (r *LitRPC) Send(args SendArgs, reply *TxidsReply) error {
 			nOutputs, len(args.Amts))
 	}
 
-	adrs := make([]btcutil.Address, nOutputs)
-
+	txOuts := make([]*wire.TxOut, nOutputs)
 	for i, s := range args.DestAddrs {
-		adrs[i], err = btcutil.DecodeAddress(s, r.SCon.TS.Param)
-		if err != nil {
-			return err
-		}
 		if args.Amts[i] < 10000 {
 			return fmt.Errorf("Amt %d less than min 10000", args.Amts[i])
 		}
+
+		outScript, err := AdrStringToOutscript(s, r.Node.SubWallet.Params())
+		if err != nil {
+			return err
+		}
+
+		txOuts[i] = wire.NewTxOut(args.Amts[i], outScript)
 	}
-	tx, err := r.SCon.TS.SendCoins(adrs, args.Amts)
-	if err != nil {
-		return err
-	}
-	err = r.SCon.NewOutgoingTx(tx)
+
+	// we don't care if it's witness or not
+	ops, err := r.Node.SubWallet.MaybeSend(txOuts, false)
 	if err != nil {
 		return err
 	}
 
-	reply.Txids = append(reply.Txids, tx.TxHash().String())
+	err = r.Node.SubWallet.ReallySend(&ops[0].Hash)
+	if err != nil {
+		return err
+	}
+
+	reply.Txids = append(reply.Txids, ops[0].Hash.String())
 	return nil
 }
 
 // ------------------------- sweep
 type SweepArgs struct {
 	DestAdr string
-	NumTx   int
+	NumTx   uint32
 	Drop    bool
 }
 
+// AdrStringToOutscript converts an address string into an output script byte slice
+func AdrStringToOutscript(adr string, p *chaincfg.Params) ([]byte, error) {
+	var err error
+	var outScript []byte
+	if adr[:3] == "tb1" || adr[:3] == "bc1" {
+		// try bech32 address
+		outScript, err = bech32.SegWitAddressDecode(adr)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		// try for base58 address
+		adr, err := btcutil.DecodeAddress(adr, p)
+		if err != nil {
+			return nil, err
+		}
+		outScript, err = txscript.PayToAddrScript(adr)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return outScript, nil
+}
+
 func (r *LitRPC) Sweep(args SweepArgs, reply *TxidsReply) error {
-	adr, err := btcutil.DecodeAddress(args.DestAdr, r.SCon.TS.Param)
+
+	outScript, err := AdrStringToOutscript(args.DestAdr, r.Node.SubWallet.Params())
 	if err != nil {
-		fmt.Printf("error parsing %s as address\t", args.DestAdr)
 		return err
 	}
+
 	fmt.Printf("numtx: %d\n", args.NumTx)
 	if args.NumTx < 1 {
 		return fmt.Errorf("can't send %d txs", args.NumTx)
 	}
-	nokori := args.NumTx
 
-	var allUtxos portxo.TxoSliceByAmt
-	allUtxos, err = r.SCon.TS.GetAllUtxos()
+	txids, err := r.Node.SubWallet.Sweep(outScript, args.NumTx)
 	if err != nil {
 		return err
 	}
 
-	// smallest and unconfirmed last (because it's reversed)
-	sort.Sort(sort.Reverse(allUtxos))
-
-	for i, u := range allUtxos {
-		if u.Height != 0 && u.Value > 10000 {
-			var txid chainhash.Hash
-			if args.Drop {
-				//				intx, outtx, err := SCon.TS.SendDrop(*allUtxos[i], adr)
-				//				if err != nil {
-				//					return err
-				//				}
-				//				txid = outtx.TxSha()
-				//				err = SCon.NewOutgoingTx(intx)
-				//				if err != nil {
-				//					return err
-				//				}
-				//				err = SCon.NewOutgoingTx(outtx)
-				//				if err != nil {
-				//					return err
-				//				}
-			} else {
-				tx, err := r.SCon.TS.SendOne(*allUtxos[i], adr)
-				if err != nil {
-					return err
-				}
-				txid = tx.TxHash()
-				err = r.SCon.NewOutgoingTx(tx)
-				if err != nil {
-					return err
-				}
-			}
-			reply.Txids = append(reply.Txids, txid.String())
-			nokori--
-			if nokori == 0 {
-				return nil
-			}
-		}
+	for _, txid := range txids {
+		reply.Txids = append(reply.Txids, txid.String())
 	}
 
-	fmt.Printf("spent all confirmed utxos; not enough by %d\n", nokori)
 	return nil
 }
 
@@ -237,45 +222,49 @@ func (r *LitRPC) Fanout(args FanArgs, reply *TxidsReply) error {
 	if args.AmtPerOutput < 5000 {
 		return fmt.Errorf("Minimum 5000 per output")
 	}
-	adr, err := btcutil.DecodeAddress(args.DestAdr, r.SCon.TS.Param)
+	outScript, err := AdrStringToOutscript(args.DestAdr, r.Node.SubWallet.Params())
 	if err != nil {
-		fmt.Printf("error parsing %s as address\t", args.DestAdr)
 		return err
 	}
-	adrs := make([]btcutil.Address, args.NumOutputs)
-	amts := make([]int64, args.NumOutputs)
 
-	for i := int64(0); i < int64(args.NumOutputs); i++ {
-		adrs[i] = adr
-		amts[i] = args.AmtPerOutput + i
+	txos := make([]*wire.TxOut, args.NumOutputs)
+
+	for i, _ := range txos {
+		txos[i] = new(wire.TxOut)
+		txos[i].Value = args.AmtPerOutput + int64(i)
+		txos[i].PkScript = outScript
 	}
-	tx, err := r.SCon.TS.SendCoins(adrs, amts)
+
+	// don't care if inputs are witty or not
+	ops, err := r.Node.SubWallet.MaybeSend(txos, false)
 	if err != nil {
 		return err
 	}
-	err = r.SCon.NewOutgoingTx(tx)
+	err = r.Node.SubWallet.ReallySend(&ops[0].Hash)
 	if err != nil {
 		return err
 	}
-	reply.Txids = append(reply.Txids, tx.TxHash().String())
+
+	reply.Txids = append(reply.Txids, ops[0].String())
 	return nil
 }
 
 // ------------------------- address
-type AdrArgs struct {
+type AddressArgs struct {
 	NumToMake uint32
 }
-type AdrReply struct {
+type AddressReply struct {
 	WitAddresses    []string
 	LegacyAddresses []string
 }
 
-func (r *LitRPC) Address(args *AdrArgs, reply *AdrReply) error {
+func (r *LitRPC) Address(args *AddressArgs, reply *AddressReply) error {
 
 	// If you tell it to make 0 new addresses, it sends a list of all the old ones
 	if args.NumToMake == 0 {
 
-		allAdr, err := r.SCon.TS.GetAllAddresses()
+		// this gets old p2pkh addresses; need to convert them to bech32
+		allAdr, err := r.Node.SubWallet.AdrDump()
 		if err != nil {
 			return err
 		}
@@ -283,16 +272,14 @@ func (r *LitRPC) Address(args *AdrArgs, reply *AdrReply) error {
 		reply.WitAddresses = make([]string, len(allAdr))
 		reply.LegacyAddresses = make([]string, len(allAdr))
 		for i, a := range allAdr {
-			// add witness address
-			reply.WitAddresses[i] = a.String()
-
-			// take 20-byte PKH out and convert to old address
-			oldAdr, err := btcutil.NewAddressPubKeyHash(
-				a.ScriptAddress(), r.SCon.Param)
+			// add old address
+			reply.LegacyAddresses[i] = a.String()
+			// take 20-byte PKH out and convert to a bech32 segwit v0 address
+			bech32adr, err := bech32.Tb1AdrFromPKH(a.ScriptAddress())
 			if err != nil {
 				return err
 			}
-			reply.LegacyAddresses[i] = oldAdr.String()
+			reply.WitAddresses[i] = bech32adr
 		}
 
 		return nil
@@ -303,25 +290,17 @@ func (r *LitRPC) Address(args *AdrArgs, reply *AdrReply) error {
 
 	remaining := args.NumToMake
 	for remaining > 0 {
-		a160, err := r.SCon.TS.NewAdr160()
+		adr := r.Node.SubWallet.NewAdr()
+
+		reply.LegacyAddresses[remaining-1] = adr.String()
+
+		// take 20-byte PKH out and convert to bech32 address
+		bech32adr, err := bech32.Tb1AdrFromPKH(adr.ScriptAddress())
 		if err != nil {
 			return err
 		}
 
-		wa, err := btcutil.NewAddressWitnessPubKeyHash(a160, r.SCon.Param)
-		if err != nil {
-			return err
-		}
-		reply.WitAddresses[remaining-1] = wa.String()
-
-		// take 20-byte PKH out and convert to old address
-		oldAdr, err := btcutil.NewAddressPubKeyHash(
-			wa.ScriptAddress(), r.SCon.Param)
-		if err != nil {
-			return err
-		}
-
-		reply.LegacyAddresses[remaining-1] = oldAdr.String()
+		reply.WitAddresses[remaining-1] = bech32adr
 		remaining--
 	}
 

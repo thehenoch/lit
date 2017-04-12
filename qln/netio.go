@@ -5,29 +5,45 @@ import (
 	"log"
 
 	"github.com/btcsuite/btcd/btcec"
-	"github.com/btcsuite/btcutil"
 	"github.com/mit-dci/lit/lndc"
 	"github.com/mit-dci/lit/lnutil"
 	"github.com/mit-dci/lit/portxo"
 )
 
+// Gets the list of ports where LitNode is listening for incoming connections,
+// & the connection key
+func (nd *LitNode) GetLisAddressAndPorts() (
+	string, []string) {
+
+	idPriv := nd.IdKey()
+	var idPub [33]byte
+	copy(idPub[:], idPriv.PubKey().SerializeCompressed())
+
+	lisAdr := lnutil.LitAdrFromPubkey(idPub)
+
+	nd.RemoteMtx.Lock()
+	ports := nd.LisIpPorts
+	nd.RemoteMtx.Unlock()
+
+	return lisAdr, ports
+}
+
 // TCPListener starts a litNode listening for incoming LNDC connections
 func (nd *LitNode) TCPListener(
-	lisIpPort string) (*btcutil.AddressWitnessPubKeyHash, error) {
+	lisIpPort string) (string, error) {
 	idPriv := nd.IdKey()
 	listener, err := lndc.NewListener(nd.IdKey(), lisIpPort)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 
-	myId := btcutil.Hash160(idPriv.PubKey().SerializeCompressed())
-	lisAdr, err := btcutil.NewAddressWitnessPubKeyHash(myId, nd.Param)
-	if err != nil {
-		return nil, err
-	}
+	var idPub [33]byte
+	copy(idPub[:], idPriv.PubKey().SerializeCompressed())
+
+	adr := lnutil.LitAdrFromPubkey(idPub)
+
 	fmt.Printf("Listening on %s\n", listener.Addr().String())
-	fmt.Printf("Listening with base58 address: %s lnid: %x\n",
-		lisAdr.String(), myId[:16])
+	fmt.Printf("Listening with ln address: %s \n", adr)
 
 	go func() {
 		for {
@@ -62,25 +78,30 @@ func (nd *LitNode) TCPListener(
 			go nd.LNDCReader(&peer)
 		}
 	}()
-	return lisAdr, nil
+	nd.RemoteMtx.Lock()
+	nd.LisIpPorts = append(nd.LisIpPorts, lisIpPort)
+	nd.RemoteMtx.Unlock()
+	return adr, nil
 }
 
 // DialPeer makes an outgoing connection to another node.
-func (nd *LitNode) DialPeer(lnAdr *lndc.LNAdr) error {
+func (nd *LitNode) DialPeer(connectAdr string) error {
+
+	// parse address and get pkh / host / port
+	who, where := lndc.SplitAdrString(connectAdr)
+
+	// sanity check the "who" pkh string
+	if !lnutil.LitAdrOK(who) {
+		return fmt.Errorf("ln address %s invalid", who)
+	}
+
 	// get my private ID key
 	idPriv := nd.IdKey()
 
 	// Assign remote connection
 	newConn := new(lndc.LNDConn)
 
-	var id []byte
-	if lnAdr.PubKey != nil {
-		id = lnAdr.PubKey.SerializeCompressed()
-	} else {
-		id = lnAdr.Base58Adr.ScriptAddress()
-	}
-
-	err := newConn.Dial(idPriv, lnAdr.NetAddr.String(), id)
+	err := newConn.Dial(idPriv, where, who)
 	if err != nil {
 		return err
 	}
@@ -137,7 +158,7 @@ type PeerInfo struct {
 
 func (nd *LitNode) GetConnectedPeerList() []PeerInfo {
 	nd.RemoteMtx.Lock()
-	nd.RemoteMtx.Unlock()
+	nd.RemoteMtx.Unlock() //TODO: This unlock is in the wrong place...?
 	var peers []PeerInfo
 	for k, v := range nd.RemoteCons {
 		var newPeer PeerInfo
@@ -165,7 +186,7 @@ func (nd *LitNode) IdKey() *btcec.PrivateKey {
 	kg.Step[2] = 9 | 1<<31
 	kg.Step[3] = 0 | 1<<31
 	kg.Step[4] = 0 | 1<<31
-	return nd.BaseWallet.GetPriv(kg)
+	return nd.SubWallet.GetPriv(kg)
 }
 
 // SendChat sends a text string to a peer

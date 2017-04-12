@@ -2,39 +2,27 @@ package main
 
 import (
 	"flag"
-	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
-	"github.com/fatih/color"
+
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/mit-dci/lit/litrpc"
+	"github.com/mit-dci/lit/lnutil"
 	"github.com/mit-dci/lit/qln"
-	"github.com/mit-dci/lit/uspv"
 )
 
 const (
 	litHomeDirName = ".lit"
 
-	keyFileName     = "testkey.hex"
-	headerFileName  = "headers.bin"
-	utxodbFileName  = "utxo.db"
-	lndbFileName    = "ln.db"
-	watchdbFileName = "watch.db"
-	sorcFileName    = "sorc.db"
+	keyFileName = "testkey.hex"
+
 	// this is my local testnet node, replace it with your own close by.
 	// Random internet testnet nodes usually work but sometimes don't, so
 	// maybe I should test against different versions out there.
-	hardHeight = 1063333 // height to start at if not specified
-)
-
-var (
-	//	Params = &chaincfg.TestNet3Params
-	//	Params = &chaincfg.RegressionNetParams
-	SCon uspv.SPVCon // global here for now
-
-	Node qln.LitNode
+	hardHeight = 1111111 // height to start at if not specified
 )
 
 // variables for a goodelivery session
@@ -42,6 +30,7 @@ type LitConfig struct {
 	spvHost               string
 	regTest, reSync, hard bool // flag to set networks
 	bc2Net                bool
+	verbose               bool
 	birthblock            int32
 	rpcport               uint16
 	litHomeDir            string
@@ -50,19 +39,22 @@ type LitConfig struct {
 }
 
 func setConfig(lc *LitConfig) {
-	spvhostptr := flag.String("spv", "172.16.120.201", "full node to connect to")
+	spvhostptr := flag.String("spv", "na", "full node to connect to")
 
 	birthptr := flag.Int("tip", hardHeight, "height to begin db sync")
 
 	easyptr := flag.Bool("ez", false, "use easy mode (bloom filters)")
 
+	verbptr := flag.Bool("v", false, "verbose; print all logs to stdout")
+
 	regtestptr := flag.Bool("reg", false, "use regtest (not testnet3)")
 	bc2ptr := flag.Bool("bc2", false, "use bc2 network (not testnet3)")
 	resyncprt := flag.Bool("resync", false, "force resync from given tip")
 
-	rpcportptr := flag.Int("rpcport", 9750, "port to listen for RPC")
+	rpcportptr := flag.Int("rpcport", 8001, "port to listen for RPC")
 
-	litHomeDir := flag.String("dir", filepath.Join(os.Getenv("HOME"), litHomeDirName), "lit home directory")
+	litHomeDir := flag.String("dir",
+		filepath.Join(os.Getenv("HOME"), litHomeDirName), "lit home directory")
 
 	flag.Parse()
 
@@ -73,6 +65,7 @@ func setConfig(lc *LitConfig) {
 	lc.bc2Net = *bc2ptr
 	lc.reSync = *resyncprt
 	lc.hard = !*easyptr
+	lc.verbose = *verbptr
 
 	lc.rpcport = uint16(*rpcportptr)
 
@@ -88,6 +81,7 @@ func setConfig(lc *LitConfig) {
 
 	if lc.regTest {
 		lc.Params = &chaincfg.RegressionNetParams
+		lc.birthblock = 120
 		if !strings.Contains(lc.spvHost, ":") {
 			lc.spvHost = lc.spvHost + ":18444"
 		}
@@ -109,8 +103,9 @@ func setConfig(lc *LitConfig) {
 }
 
 func main() {
-	fmt.Fprintf(color.Output,"lit node v0.0\n")
-	fmt.Fprintf(color.Output,"-h for list of options.\n")
+
+	log.Printf("lit node v0.1\n")
+	log.Printf("-h for list of options.\n")
 
 	conf := new(LitConfig)
 	setConfig(conf)
@@ -120,93 +115,39 @@ func main() {
 		os.Mkdir(conf.litHomeDir, 0700)
 	}
 
-	// define file paths based on lit home directory
+	logFilePath := filepath.Join(conf.litHomeDir, "lit.log")
+
+	logfile, err := os.OpenFile(logFilePath, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+	defer logfile.Close()
+
+	if conf.verbose {
+		logOutput := io.MultiWriter(os.Stdout, logfile)
+		log.SetOutput(logOutput)
+	} else {
+		log.SetOutput(logfile)
+	}
+
 	keyFilePath := filepath.Join(conf.litHomeDir, keyFileName)
-	headerFilePath := filepath.Join(conf.litHomeDir, headerFileName)
-	utxodbFilePath := filepath.Join(conf.litHomeDir, utxodbFileName)
-	lndbFilePath := filepath.Join(conf.litHomeDir, lndbFileName)
-	watchdbFilePath := filepath.Join(conf.litHomeDir, watchdbFileName)
 
 	// read key file (generate if not found)
-	rootPriv, err := uspv.ReadKeyFileToECPriv(keyFilePath, conf.Params)
+	key, err := lnutil.ReadKeyFile(keyFilePath)
 	if err != nil {
 		log.Fatal(err)
-	}
-	// setup TxStore first (before spvcon)
-	Store := uspv.NewTxStore(rootPriv, conf.Params)
-
-	// setup SPVCon
-	SCon, err = uspv.OpenSPV(headerFilePath, utxodbFilePath, &Store,
-		conf.hard, false, conf.Params)
-	if err != nil {
-		log.Printf("can't connect: %s", err.Error())
-		log.Fatal(err) // back to fatal when can't connect
 	}
 
 	// Setup LN node.  Activate Tower if in hard mode.
-	err = Node.Init(lndbFilePath, watchdbFilePath, &SCon, SCon.HardMode)
+	// give node and below file pathof lit home directoy
+	node, err := qln.NewLitNode(conf.litHomeDir, false)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	tip, err := SCon.TS.GetDBSyncHeight() // ask for sync height
+	err = node.LinkBaseWallet(key, conf.birthblock, conf.spvHost, conf.Params)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	if tip == 0 || conf.reSync { // DB has never been used, set to birthday
-		if conf.regTest || conf.bc2Net {
-			if conf.birthblock < 100000 {
-				tip = conf.birthblock
-			} else {
-				tip = 500 // for regtest/bc2
-			}
-		} else {
-			tip = conf.birthblock // for testnet3. should base on keyfile date?
-		}
-		err = SCon.TS.SetDBSyncHeight(tip)
-		if err != nil {
-			log.Fatal(err)
-		}
-	}
-
-	// Connect to full node
-	err = SCon.Connect(conf.spvHost)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// once we're connected, initiate headers sync
-	err = SCon.AskForHeaders()
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// shell loop -- to be removed
-	/*
-		go func() {
-			for {
-				// setup reader with max 4K input chars
-				reader := bufio.NewReaderSize(os.Stdin, 4000)
-				fmt.Fprintf(color.Output,"LND# ")                 // prompt
-				msg, err := reader.ReadString('\n') // input finishes on enter key
-				if err != nil {
-					log.Fatal(err)
-				}
-
-				cmdslice := strings.Fields(msg) // chop input up on whitespace
-				if len(cmdslice) < 1 {
-					continue // no input, just prompt again
-				}
-				fmt.Fprintf(color.Output,"entered command: %s\n", msg) // immediate feedback
-				err = Shellparse(cmdslice)
-				if err != nil { // only error should be user exit
-					log.Fatal(err)
-				}
-			}
-		}()
-	*/
-	litrpc.RpcListen(&SCon, &Node, conf.rpcport)
+	litrpc.RpcListen(node, conf.rpcport)
 
 	return
 }
